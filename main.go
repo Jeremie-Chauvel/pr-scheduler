@@ -11,14 +11,16 @@
 //
 // Keys:
 //   - Up/Down or j/k: move selection
-//   - Enter: schedule auto-merge for selected PR
+//   - Enter: schedule auto-merge for selected PR (opens time picker)
 //   - m: toggle "only my PRs"
 //   - r: refresh PR list
-//   - q: quit
+//   - q: quit (will warn if there are active scheduled merges)
 //
-// When scheduling, enter time as:
-//   - "now" (or leave empty) => immediate
-//   - "YYYY-MM-DD HH:MM" (24h, local time)
+// Time picker:
+//   - Navigate with Up/Down or j/k
+//   - Select from presets: Now, 5min, 15min, 30min, 1h, 2h, 4h, 8h, 12h, 24h
+//   - Choose "Custom time..." for manual entry (YYYY-MM-DD HH:MM format)
+//   - Esc: cancel/go back
 package main
 
 import (
@@ -56,6 +58,22 @@ func (i prItem) Description() string {
 	return fmt.Sprintf("%s | %s | @%s", i.p.State, i.p.MergeState, i.p.Author)
 }
 func (i prItem) FilterValue() string { return i.p.Title }
+
+// Time preset for the time picker
+type timePreset struct {
+	Label       string
+	Description string
+	IsCustom    bool
+	Duration    time.Duration // Used if not custom
+}
+
+type timePresetItem struct {
+	preset timePreset
+}
+
+func (i timePresetItem) Title() string       { return i.preset.Label }
+func (i timePresetItem) Description() string { return i.preset.Description }
+func (i timePresetItem) FilterValue() string { return i.preset.Label }
 
 // For scheduling auto-merge of a PR.
 type scheduledMerge struct {
@@ -205,26 +223,51 @@ type mode int
 
 const (
 	modeListing mode = iota
+	modeTimePicker
 	modeScheduling
 )
 
 type model struct {
 	width, height int
 
-	list      list.Model
-	prs       []pr
-	onlyMine  bool
-	me        string
-	status    string
-	lastErr   error
-	mode      mode
-	input     textinput.Model
-	schedFor  *pr
-	scheduled []scheduledMerge
-	now       time.Time
+	list         list.Model
+	timePicker   list.Model
+	prs          []pr
+	onlyMine     bool
+	me           string
+	status       string
+	lastErr      error
+	mode         mode
+	input        textinput.Model
+	schedFor     *pr
+	scheduled    []scheduledMerge
+	now          time.Time
+	quitWarned   bool
 }
 
 // ---------- Init ----------
+
+func getTimePresets() []list.Item {
+	presets := []timePreset{
+		{Label: "Now", Description: "Merge immediately", IsCustom: false, Duration: 0},
+		{Label: "In 5 minutes", Description: "Merge in 5 minutes", IsCustom: false, Duration: 5 * time.Minute},
+		{Label: "In 15 minutes", Description: "Merge in 15 minutes", IsCustom: false, Duration: 15 * time.Minute},
+		{Label: "In 30 minutes", Description: "Merge in 30 minutes", IsCustom: false, Duration: 30 * time.Minute},
+		{Label: "In 1 hour", Description: "Merge in 1 hour", IsCustom: false, Duration: 1 * time.Hour},
+		{Label: "In 2 hours", Description: "Merge in 2 hours", IsCustom: false, Duration: 2 * time.Hour},
+		{Label: "In 4 hours", Description: "Merge in 4 hours", IsCustom: false, Duration: 4 * time.Hour},
+		{Label: "In 8 hours", Description: "Merge in 8 hours", IsCustom: false, Duration: 8 * time.Hour},
+		{Label: "In 12 hours", Description: "Merge in 12 hours", IsCustom: false, Duration: 12 * time.Hour},
+		{Label: "In 24 hours", Description: "Merge tomorrow at this time", IsCustom: false, Duration: 24 * time.Hour},
+		{Label: "Custom time...", Description: "Enter a custom date/time", IsCustom: true, Duration: 0},
+	}
+
+	items := make([]list.Item, len(presets))
+	for i, p := range presets {
+		items[i] = timePresetItem{preset: p}
+	}
+	return items
+}
 
 func initialModel() model {
 	ti := textinput.New()
@@ -237,13 +280,21 @@ func initialModel() model {
 	l.Title = "Open pull requests"
 	l.SetShowHelp(true)
 
+	// Time picker list
+	timeDelegate := list.NewDefaultDelegate()
+	tp := list.New(getTimePresets(), timeDelegate, 0, 0)
+	tp.Title = "When to merge?"
+	tp.SetShowHelp(false)
+	tp.SetFilteringEnabled(false)
+
 	return model{
-		list:      l,
-		status:    "Loading...",
-		mode:      modeListing,
-		input:     ti,
-		scheduled: []scheduledMerge{},
-		now:       time.Now(),
+		list:       l,
+		timePicker: tp,
+		status:     "Loading...",
+		mode:       modeListing,
+		input:      ti,
+		scheduled:  []scheduledMerge{},
+		now:        time.Now(),
 	}
 }
 
@@ -286,6 +337,15 @@ func (m *model) findScheduledIndex(prNumber int) int {
 	return -1
 }
 
+func (m *model) hasActiveSchedules() bool {
+	for _, s := range m.scheduled {
+		if !s.Done {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------- Update ----------
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -295,6 +355,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.list.SetSize(m.width, m.height-5)
+		m.timePicker.SetSize(m.width, m.height-5)
 		return m, nil
 
 	case meMsg:
@@ -373,6 +434,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		if m.mode == modeScheduling {
 			return m.updateSchedulingKey(msg)
+		} else if m.mode == modeTimePicker {
+			return m.updateTimePickerKey(msg)
 		}
 		return m.updateListingKey(msg)
 
@@ -381,6 +444,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.mode == modeScheduling {
 			var cmd tea.Cmd
 			m.input, cmd = m.input.Update(msg)
+			return m, cmd
+		} else if m.mode == modeTimePicker {
+			var cmd tea.Cmd
+			m.timePicker, cmd = m.timePicker.Update(msg)
 			return m, cmd
 		}
 		var cmd tea.Cmd
@@ -392,19 +459,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) updateListingKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
+		// Check if there are active scheduled merges
+		if m.hasActiveSchedules() && !m.quitWarned {
+			m.quitWarned = true
+			m.status = "Warning: Active scheduled merges! Press 'q' again to force quit."
+			return m, nil
+		}
 		return m, tea.Quit
 
 	case "m":
+		m.quitWarned = false // Reset quit warning
 		m.onlyMine = !m.onlyMine
 		m.applyFilter()
 		return m, nil
 
 	case "r":
+		m.quitWarned = false // Reset quit warning
 		m.status = "Refreshing PR list..."
 		return m, fetchPRsCmd()
 
 	case "enter":
-		// Start scheduling for selected PR.
+		m.quitWarned = false // Reset quit warning
+		// Start time picker for selected PR.
 		if item, ok := m.list.SelectedItem().(prItem); ok {
 			p := item.p
 			// Avoid scheduling duplicates for same PR if one is already active.
@@ -413,17 +489,67 @@ func (m model) updateListingKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.schedFor = &p
-			m.input.SetValue("")
-			m.input.CursorEnd()
-			m.input.Focus()
-			m.mode = modeScheduling
-			m.status = fmt.Sprintf("Scheduling auto-merge for PR #%d", p.Number)
+			m.mode = modeTimePicker
+			m.status = fmt.Sprintf("Select merge time for PR #%d", p.Number)
 		}
 		return m, nil
 	}
 
+	// Reset quit warning on any other key
+	m.quitWarned = false
 	var cmd tea.Cmd
 	m.list, cmd = m.list.Update(msg)
+	return m, cmd
+}
+
+func (m model) updateTimePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		// User selected a time preset
+		if item, ok := m.timePicker.SelectedItem().(timePresetItem); ok {
+			preset := item.preset
+
+			if preset.IsCustom {
+				// Switch to custom text input mode
+				m.input.SetValue("")
+				m.input.CursorEnd()
+				m.input.Focus()
+				m.mode = modeScheduling
+				m.status = "Enter custom time for PR #" + strconv.Itoa(m.schedFor.Number)
+				return m, nil
+			}
+
+			// Use the preset duration
+			when := m.now.Add(preset.Duration)
+
+			if m.schedFor == nil {
+				m.status = "No PR selected to schedule."
+				m.mode = modeListing
+				return m, nil
+			}
+
+			s := scheduledMerge{
+				PR:      *m.schedFor,
+				When:    when,
+				CheckAt: time.Time{}, // set after auto-merge triggers
+			}
+			m.scheduled = append(m.scheduled, s)
+			m.status = fmt.Sprintf("Scheduled auto-merge for PR #%d at %s", s.PR.Number, when.Format("2006-01-02 15:04"))
+			m.mode = modeListing
+			m.schedFor = nil
+			return m, nil
+		}
+		return m, nil
+
+	case "esc", "q":
+		m.mode = modeListing
+		m.status = "Scheduling cancelled"
+		m.schedFor = nil
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.timePicker, cmd = m.timePicker.Update(msg)
 	return m, cmd
 }
 
@@ -466,9 +592,9 @@ func (m model) updateSchedulingKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyEsc:
-		m.mode = modeListing
+		m.mode = modeTimePicker
 		m.input.Blur()
-		m.status = "Scheduling cancelled"
+		m.status = "Back to time selection"
 		return m, nil
 	}
 
@@ -503,6 +629,9 @@ func (m model) View() string {
 		b.WriteString("Enter schedule time (local):\n")
 		b.WriteString(m.input.View())
 		b.WriteString("\n\n")
+	} else if m.mode == modeTimePicker {
+		b.WriteString(m.timePicker.View())
+		b.WriteString("\n")
 	} else {
 		b.WriteString(m.list.View())
 		b.WriteString("\n")
