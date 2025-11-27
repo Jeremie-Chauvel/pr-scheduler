@@ -186,8 +186,8 @@ func checkMergedCmd(prNumber int, title string) tea.Cmd {
 	return func() tea.Msg {
 		// Ask gh if the PR is merged.
 		cmd := exec.Command("gh", "pr", "view", strconv.Itoa(prNumber),
-			"--json", "merged",
-			"--jq", ".merged",
+			"--json", "state",
+			"--jq", ".state",
 		)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -199,7 +199,7 @@ func checkMergedCmd(prNumber int, title string) tea.Cmd {
 		}
 
 		mergedStr := strings.TrimSpace(string(out))
-		merged := mergedStr == "true"
+		merged := mergedStr == "MERGED"
 
 		if !merged {
 			// Send desktop notification if the PR is not merged yet.
