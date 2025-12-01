@@ -77,13 +77,15 @@ func (i timePresetItem) FilterValue() string { return i.preset.Label }
 
 // For scheduling auto-merge of a PR.
 type scheduledMerge struct {
-	PR             pr
-	When           time.Time
-	MergeTriggered bool
-	CheckScheduled bool
-	CheckAt        time.Time
-	Done           bool
-	LastMessage    string
+	PR                    pr
+	When                  time.Time
+	PreMergeCommentPosted bool
+	MergeTriggered        bool
+	CheckScheduled        bool
+	CheckAt               time.Time
+	FailureHandled        bool
+	Done                  bool
+	LastMessage           string
 }
 
 // ---------- Messages ----------
@@ -100,6 +102,20 @@ type (
 	checkMergedMsg struct {
 		prNumber int
 		merged   bool
+		err      error
+	}
+	commentResultMsg struct {
+		prNumber    int
+		isPreMerge  bool
+		err         error
+	}
+	disableAutoMergeResultMsg struct {
+		prNumber int
+		err      error
+	}
+	commitSHAMsg struct {
+		prNumber int
+		sha      string
 		err      error
 	}
 )
@@ -182,7 +198,40 @@ func mergePRCmd(prNumber int) tea.Cmd {
 	}
 }
 
-func checkMergedCmd(prNumber int, title string) tea.Cmd {
+func commentPRCmd(prNumber int, body string, isPreMerge bool) tea.Cmd {
+	return func() tea.Msg {
+		cmd := exec.Command("gh", "pr", "comment", strconv.Itoa(prNumber), "--body", body)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return commentResultMsg{prNumber: prNumber, isPreMerge: isPreMerge, err: fmt.Errorf("gh pr comment failed: %w (%s)", err, string(out))}
+		}
+		return commentResultMsg{prNumber: prNumber, isPreMerge: isPreMerge, err: nil}
+	}
+}
+
+func disableAutoMergeCmd(prNumber int) tea.Cmd {
+	return func() tea.Msg {
+		cmd := exec.Command("gh", "pr", "merge", "--disable-auto", strconv.Itoa(prNumber))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return disableAutoMergeResultMsg{prNumber: prNumber, err: fmt.Errorf("gh pr merge --disable-auto failed: %w (%s)", err, string(out))}
+		}
+		return disableAutoMergeResultMsg{prNumber: prNumber, err: nil}
+	}
+}
+
+func getCommitSHACmd(prNumber int) tea.Cmd {
+	return func() tea.Msg {
+		cmd := exec.Command("gh", "pr", "view", strconv.Itoa(prNumber), "--json", "headRefOid", "--jq", ".headRefOid")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return commitSHAMsg{prNumber: prNumber, sha: "", err: fmt.Errorf("gh pr view failed: %w (%s)", err, string(out))}
+		}
+		return commitSHAMsg{prNumber: prNumber, sha: strings.TrimSpace(string(out)), err: nil}
+	}
+}
+
+func checkMergedCmd(prNumber int) tea.Cmd {
 	return func() tea.Msg {
 		// Ask gh if the PR is merged.
 		cmd := exec.Command("gh", "pr", "view", strconv.Itoa(prNumber),
@@ -200,14 +249,6 @@ func checkMergedCmd(prNumber int, title string) tea.Cmd {
 
 		mergedStr := strings.TrimSpace(string(out))
 		merged := mergedStr == "MERGED"
-
-		if !merged {
-			// Send desktop notification if the PR is not merged yet.
-			// This assumes Linux with notify-send available.
-			notifyTitle := "PR not merged"
-			notifyBody := fmt.Sprintf("PR #%d (%s) is still not merged after auto-merge.", prNumber, title)
-			_ = exec.Command("notify-send", notifyTitle, notifyBody, "-u", "critical").Run()
-		}
 
 		return checkMergedMsg{
 			prNumber: prNumber,
@@ -383,17 +424,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if s.Done {
 				continue
 			}
-			// Trigger auto-merge once the scheduled time has passed.
-			if !s.MergeTriggered && !s.When.IsZero() && m.now.After(s.When) {
-				s.MergeTriggered = true
-				s.LastMessage = fmt.Sprintf("Triggering auto-merge for PR #%d", s.PR.Number)
-				cmds = append(cmds, mergePRCmd(s.PR.Number))
+			// First, post a comment before triggering auto-merge.
+			if !s.PreMergeCommentPosted && !s.When.IsZero() && m.now.After(s.When) {
+				s.PreMergeCommentPosted = true
+				s.LastMessage = fmt.Sprintf("Posting pre-merge comment for PR #%d", s.PR.Number)
+				comment := fmt.Sprintf("Setting PR to auto-merge. Scheduled merge time: %s", s.When.Format("2006-01-02 15:04"))
+				cmds = append(cmds, commentPRCmd(s.PR.Number, comment, true))
 			}
 			// After we have a CheckAt time and it's passed, schedule a check.
 			if s.MergeTriggered && !s.CheckScheduled && !s.CheckAt.IsZero() && m.now.After(s.CheckAt) {
 				s.CheckScheduled = true
 				s.LastMessage = fmt.Sprintf("Checking merge status for PR #%d", s.PR.Number)
-				cmds = append(cmds, checkMergedCmd(s.PR.Number, s.PR.Title))
+				cmds = append(cmds, checkMergedCmd(s.PR.Number))
 			}
 		}
 		// Keep ticking.
@@ -419,15 +461,84 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case checkMergedMsg:
 		idx := m.findScheduledIndex(msg.prNumber)
 		if idx >= 0 {
-			m.scheduled[idx].Done = true
 			if msg.err != nil {
+				m.scheduled[idx].Done = true
 				m.scheduled[idx].LastMessage = "Check failed: " + msg.err.Error()
+				m.status = fmt.Sprintf("PR #%d: %s", msg.prNumber, m.scheduled[idx].LastMessage)
 			} else if msg.merged {
+				m.scheduled[idx].Done = true
 				m.scheduled[idx].LastMessage = "PR is merged"
+				m.status = fmt.Sprintf("PR #%d: %s", msg.prNumber, m.scheduled[idx].LastMessage)
 			} else {
-				m.scheduled[idx].LastMessage = "PR is still not merged (notification sent)"
+				// PR is not merged - get commit SHA to include in failure comment
+				m.scheduled[idx].LastMessage = "PR not merged, fetching commit SHA..."
+				m.status = fmt.Sprintf("PR #%d: %s", msg.prNumber, m.scheduled[idx].LastMessage)
+				return m, getCommitSHACmd(msg.prNumber)
 			}
-			m.status = fmt.Sprintf("PR #%d: %s", msg.prNumber, m.scheduled[idx].LastMessage)
+		}
+		return m, nil
+
+	case commitSHAMsg:
+		idx := m.findScheduledIndex(msg.prNumber)
+		if idx >= 0 {
+			s := &m.scheduled[idx]
+			sha := msg.sha
+			if msg.err != nil {
+				sha = "unknown"
+			}
+			// Disable auto-merge and post failure comment
+			s.FailureHandled = true
+			s.LastMessage = "Disabling auto-merge and posting failure comment..."
+			m.status = fmt.Sprintf("PR #%d: %s", msg.prNumber, s.LastMessage)
+
+			failureComment := fmt.Sprintf("Auto-merge did not complete successfully. Disabling auto-merge.\n\nCurrent commit: %s", sha)
+
+			// Send desktop notification
+			notifyTitle := "PR not merged"
+			notifyBody := fmt.Sprintf("PR #%d (%s) is still not merged after auto-merge.", msg.prNumber, s.PR.Title)
+			_ = exec.Command("notify-send", notifyTitle, notifyBody, "-u", "critical").Run()
+
+			return m, tea.Batch(
+				disableAutoMergeCmd(msg.prNumber),
+				commentPRCmd(msg.prNumber, failureComment, false),
+			)
+		}
+		return m, nil
+
+	case commentResultMsg:
+		idx := m.findScheduledIndex(msg.prNumber)
+		if idx >= 0 {
+			if msg.isPreMerge {
+				// Pre-merge comment posted, now trigger auto-merge
+				if msg.err != nil {
+					m.scheduled[idx].LastMessage = "Comment failed: " + msg.err.Error() + " (continuing with merge)"
+				} else {
+					m.scheduled[idx].LastMessage = "Pre-merge comment posted, triggering auto-merge..."
+				}
+				m.scheduled[idx].MergeTriggered = true
+				m.status = fmt.Sprintf("PR #%d: %s", msg.prNumber, m.scheduled[idx].LastMessage)
+				return m, mergePRCmd(msg.prNumber)
+			} else {
+				// Failure comment posted - mark as done
+				m.scheduled[idx].Done = true
+				if msg.err != nil {
+					m.scheduled[idx].LastMessage = "PR not merged (failure comment failed: " + msg.err.Error() + ")"
+				} else {
+					m.scheduled[idx].LastMessage = "PR not merged (auto-merge disabled, notification sent)"
+				}
+				m.status = fmt.Sprintf("PR #%d: %s", msg.prNumber, m.scheduled[idx].LastMessage)
+			}
+		}
+		return m, nil
+
+	case disableAutoMergeResultMsg:
+		idx := m.findScheduledIndex(msg.prNumber)
+		if idx >= 0 {
+			if msg.err != nil {
+				// Log the error but don't fail - the comment is more important
+				m.scheduled[idx].LastMessage = "Failed to disable auto-merge: " + msg.err.Error()
+			}
+			// Don't mark as done here - wait for the comment result
 		}
 		return m, nil
 
