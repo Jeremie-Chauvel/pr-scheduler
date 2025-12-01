@@ -291,6 +291,8 @@ type model struct {
 func getTimePresets() []list.Item {
 	presets := []timePreset{
 		{Label: "Now", Description: "Merge immediately", IsCustom: false, Duration: 0},
+		{Label: "In 1 minute", Description: "Merge in 1 minute", IsCustom: false, Duration: 1 * time.Minute},
+		{Label: "In 2 minutes", Description: "Merge in 2 minutes", IsCustom: false, Duration: 2 * time.Minute},
 		{Label: "In 5 minutes", Description: "Merge in 5 minutes", IsCustom: false, Duration: 5 * time.Minute},
 		{Label: "In 15 minutes", Description: "Merge in 15 minutes", IsCustom: false, Duration: 15 * time.Minute},
 		{Label: "In 30 minutes", Description: "Merge in 30 minutes", IsCustom: false, Duration: 30 * time.Minute},
